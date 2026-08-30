@@ -109,7 +109,7 @@ DT_SINGLELINE = 0x00000020
 
 # Startup and single-instance identity
 APP_NAME = "MX Master 3S Hotkeys"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 UPDATE_MANIFEST_URL = (
     "https://raw.githubusercontent.com/AdolfTWN/"
     "windows-utilities/main/latest.json"
@@ -1118,20 +1118,42 @@ def _wait_until_stopped(timeout_seconds: float = 3.0) -> None:
         time.sleep(0.1)
 
 
-def _wait_for_instance_release(timeout_ms: int = 4000) -> None:
+def _wait_for_instance_release(timeout_ms: int = 4000) -> bool:
     mutex = kernel32.OpenMutexW(
         SYNCHRONIZE | MUTEX_MODIFY_STATE,
         False,
         MUTEX_NAME,
     )
     if not mutex:
-        return
+        return True
     try:
         result = kernel32.WaitForSingleObject(mutex, timeout_ms)
         if result in (WAIT_OBJECT_0, WAIT_ABANDONED):
             kernel32.ReleaseMutex(mutex)
+            return True
+        return False
     finally:
         kernel32.CloseHandle(mutex)
+
+
+def _start_installed_app(timeout_seconds: float = 8.0) -> None:
+    destination = _installed_script_path()
+    process = subprocess.Popen(
+        [str(_pythonw_path()), str(destination)],
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        close_fds=True,
+    )
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if user32.FindWindowW(WINDOW_CLASS_NAME, WINDOW_TITLE):
+            return
+        exit_code = process.poll()
+        if exit_code is not None:
+            raise RuntimeError(
+                f"The background app exited before it became ready (code {exit_code})."
+            )
+        time.sleep(0.1)
+    raise RuntimeError("The background app did not become ready in time.")
 
 
 def install_startup() -> int:
@@ -1140,7 +1162,11 @@ def install_startup() -> int:
 
     _request_running_app_exit()
     _wait_until_stopped()
-    _wait_for_instance_release()
+    if not _wait_for_instance_release():
+        raise RuntimeError(
+            "The previous background instance did not stop. Sign out of Windows "
+            "once, then run this file again."
+        )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     if source != destination:
@@ -1148,10 +1174,13 @@ def install_startup() -> int:
 
     _write_startup_registry()
 
-    subprocess.Popen(
-        [str(_pythonw_path()), str(destination)],
-        creationflags=subprocess.CREATE_NO_WINDOW,
-        close_fds=True,
+    _start_installed_app()
+    user32.MessageBoxW(
+        None,
+        "MX Master 3S Hotkeys is installed and active.\n\n"
+        "The notification icon will remain available near the Windows clock.",
+        APP_NAME,
+        MB_OK | MB_ICONINFORMATION,
     )
     print(f"{APP_NAME} installed and started.")
     print("It will start automatically after you sign in to Windows.")
@@ -1225,13 +1254,31 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.install:
-        return install_startup()
+        try:
+            return install_startup()
+        except (OSError, RuntimeError) as error:
+            user32.MessageBoxW(
+                None,
+                f"Unable to install or start {APP_NAME}:\n\n{error}",
+                APP_NAME,
+                MB_OK | MB_ICONERROR,
+            )
+            return 1
     if args.uninstall:
         return uninstall_startup()
     if args.apply_update:
         return apply_update(args.apply_update)
     if Path(__file__).resolve() != _installed_script_path().resolve():
-        return install_startup()
+        try:
+            return install_startup()
+        except (OSError, RuntimeError) as error:
+            user32.MessageBoxW(
+                None,
+                f"Unable to install or start {APP_NAME}:\n\n{error}",
+                APP_NAME,
+                MB_OK | MB_ICONERROR,
+            )
+            return 1
     _write_startup_registry()
     return run_tray_app()
 

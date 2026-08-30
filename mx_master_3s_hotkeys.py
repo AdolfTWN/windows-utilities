@@ -11,7 +11,9 @@ First run:
 
 The first run installs it for the current user, starts it silently, and enables
 Always Run after Windows sign-in. The notification-area menu contains
-"Always Run" and "Uninstall...". Uninstall requires explicit confirmation.
+"Check for Updates", "Always Run", and "Uninstall...". Updates are downloaded
+from the public release repository, verified, installed, and restarted
+automatically. Uninstall requires explicit confirmation.
 
 The program uses only Python's standard library. Windows' low-level mouse hook
 does not identify the physical mouse, so the mappings apply to the same buttons
@@ -22,13 +24,20 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
+import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from ctypes import wintypes
 from pathlib import Path
 
@@ -84,8 +93,10 @@ TPM_RETURNCMD = 0x0100
 TPM_NONOTIFY = 0x0080
 ID_ALWAYS_RUN = 1001
 ID_UNINSTALL = 1002
+ID_CHECK_FOR_UPDATES = 1003
 MB_OK = 0x00000000
 MB_ICONINFORMATION = 0x00000040
+MB_ICONERROR = 0x00000010
 MB_ICONQUESTION = 0x00000020
 MB_YESNO = 0x00000004
 MB_DEFBUTTON2 = 0x00000100
@@ -98,6 +109,18 @@ DT_SINGLELINE = 0x00000020
 
 # Startup and single-instance identity
 APP_NAME = "MX Master 3S Hotkeys"
+APP_VERSION = "1.1.0"
+UPDATE_MANIFEST_URL = (
+    "https://raw.githubusercontent.com/AdolfTWN/"
+    "windows-utilities/main/latest.json"
+)
+UPDATE_DOWNLOAD_PREFIX = (
+    "https://raw.githubusercontent.com/AdolfTWN/"
+    "windows-utilities/"
+)
+UPDATE_TIMEOUT_SECONDS = 15
+MAX_MANIFEST_BYTES = 16 * 1024
+MAX_SCRIPT_BYTES = 2 * 1024 * 1024
 RUN_VALUE_NAME = "MXMaster3SHotkeys"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 WINDOW_CLASS_NAME = "MXMaster3SHotkeysTrayWindow"
@@ -660,7 +683,62 @@ class TrayApplication:
         self._icon: wintypes.HICON | None = None
         self._owns_icon = False
         self._uninstalling = False
+        self._update_in_progress = False
         self._wndproc = WNDPROC(self._window_proc)
+
+    def _show_message(self, text: str, title: str = APP_NAME, error: bool = False) -> None:
+        user32.MessageBoxW(
+            self.hwnd,
+            text,
+            title,
+            MB_OK | (MB_ICONERROR if error else MB_ICONINFORMATION),
+        )
+
+    def _check_for_updates(self) -> None:
+        if self._update_in_progress:
+            return
+        self._update_in_progress = True
+
+        def worker() -> None:
+            try:
+                update = _download_update()
+                if update is None:
+                    self._show_message(
+                        f"You already have the latest version ({APP_VERSION})."
+                    )
+                    return
+
+                staged_path, new_version = update
+                destination = _installed_script_path()
+                subprocess.Popen(
+                    [
+                        str(_pythonw_path()),
+                        str(destination),
+                        "--apply-update",
+                        str(staged_path),
+                    ],
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    close_fds=True,
+                )
+                self._show_message(
+                    f"Version {new_version} was downloaded successfully.\n\n"
+                    "The app will now restart to finish the update."
+                )
+                self.request_exit()
+            except (OSError, RuntimeError, ValueError) as error:
+                self._show_message(
+                    f"Unable to check for updates:\n\n{error}",
+                    title="Update Error",
+                    error=True,
+                )
+            finally:
+                self._update_in_progress = False
+
+        threading.Thread(
+            target=worker,
+            name="MXMasterUpdateCheck",
+            daemon=True,
+        ).start()
 
     def _confirm_uninstall(self) -> None:
         if not self.hwnd:
@@ -718,6 +796,13 @@ class TrayApplication:
         try:
             user32.AppendMenuW(
                 menu,
+                MF_STRING,
+                ID_CHECK_FOR_UPDATES,
+                "Check for Updates",
+            )
+            user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+            user32.AppendMenuW(
+                menu,
                 MF_STRING | MF_CHECKED,
                 ID_ALWAYS_RUN,
                 "Always Run",
@@ -736,7 +821,9 @@ class TrayApplication:
                 self.hwnd,
                 None,
             )
-            if command == ID_ALWAYS_RUN:
+            if command == ID_CHECK_FOR_UPDATES:
+                self._check_for_updates()
+            elif command == ID_ALWAYS_RUN:
                 self._confirm_always_run()
             elif command == ID_UNINSTALL:
                 self._confirm_uninstall()
@@ -829,7 +916,7 @@ class TrayApplication:
         notify_data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
         notify_data.uCallbackMessage = WM_TRAYICON
         notify_data.hIcon = icon
-        notify_data.szTip = f"{APP_NAME} — Always Run"
+        notify_data.szTip = f"{APP_NAME} {APP_VERSION} — Always Run"
         self._notify_data = notify_data
 
         if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(notify_data)):
@@ -855,6 +942,132 @@ def _installed_script_path() -> Path:
     if not local_app_data:
         raise RuntimeError("LOCALAPPDATA is not available.")
     return Path(local_app_data) / "MXMaster3SHotkeys" / "mx_master_3s_hotkeys.pyw"
+
+
+def _read_url(url: str, maximum_bytes: int) -> bytes:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json, text/plain, */*",
+            "Cache-Control": "no-cache",
+            "User-Agent": f"MXMaster3SHotkeys/{APP_VERSION}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=UPDATE_TIMEOUT_SECONDS) as response:
+            if response.status != 200:
+                raise RuntimeError(f"GitHub returned HTTP {response.status}.")
+            data = response.read(maximum_bytes + 1)
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"GitHub returned HTTP {error.code}.") from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(f"Network error: {error.reason}") from error
+    if len(data) > maximum_bytes:
+        raise RuntimeError("The update response was unexpectedly large.")
+    return data
+
+
+def _version_tuple(version: str) -> tuple[int, int, int]:
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise ValueError(f"Invalid update version: {version!r}")
+    return tuple(int(part) for part in version.split("."))  # type: ignore[return-value]
+
+
+def _validate_download_url(url: str) -> None:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or not url.startswith(UPDATE_DOWNLOAD_PREFIX):
+        raise RuntimeError("The update manifest contains an untrusted download URL.")
+
+
+def _download_update() -> tuple[Path, str] | None:
+    manifest_bytes = _read_url(UPDATE_MANIFEST_URL, MAX_MANIFEST_BYTES)
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("The update manifest is invalid.") from error
+    if not isinstance(manifest, dict):
+        raise RuntimeError("The update manifest is invalid.")
+
+    version = manifest.get("version")
+    download_url = manifest.get("url")
+    expected_sha256 = manifest.get("sha256")
+    if not all(isinstance(value, str) for value in (version, download_url, expected_sha256)):
+        raise RuntimeError("The update manifest is missing required fields.")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256):
+        raise RuntimeError("The update manifest contains an invalid checksum.")
+    _validate_download_url(download_url)
+    if _version_tuple(version) <= _version_tuple(APP_VERSION):
+        return None
+
+    script_bytes = _read_url(download_url, MAX_SCRIPT_BYTES)
+    actual_sha256 = hashlib.sha256(script_bytes).hexdigest()
+    if actual_sha256.lower() != expected_sha256.lower():
+        raise RuntimeError("The downloaded update failed checksum verification.")
+
+    try:
+        source = script_bytes.decode("utf-8")
+        compile(source, "mx_master_3s_hotkeys.pyw", "exec")
+    except (UnicodeDecodeError, SyntaxError) as error:
+        raise RuntimeError("The downloaded update is not a valid Python program.") from error
+    version_match = re.search(
+        r'^APP_VERSION\s*=\s*["\']([^"\']+)["\']\s*$',
+        source,
+        re.MULTILINE,
+    )
+    if not version_match or version_match.group(1) != version:
+        raise RuntimeError("The downloaded update version does not match its manifest.")
+
+    destination = _installed_script_path()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary_name = tempfile.mkstemp(
+        prefix="mx_master_update_",
+        suffix=".pyw",
+        dir=destination.parent,
+    )
+    staged_path = Path(temporary_name)
+    try:
+        with os.fdopen(handle, "wb") as temporary_file:
+            temporary_file.write(script_bytes)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+    except BaseException:
+        staged_path.unlink(missing_ok=True)
+        raise
+    return staged_path, version
+
+
+def apply_update(staged_path: Path) -> int:
+    destination = _installed_script_path()
+    try:
+        staged_path = staged_path.resolve(strict=True)
+        if staged_path.parent != destination.parent.resolve():
+            raise RuntimeError("The staged update is in an unexpected location.")
+        if not staged_path.name.startswith("mx_master_update_"):
+            raise RuntimeError("The staged update has an unexpected name.")
+
+        _wait_until_stopped(timeout_seconds=10.0)
+        _wait_for_instance_release(timeout_ms=10000)
+        os.replace(staged_path, destination)
+        _write_startup_registry()
+        subprocess.Popen(
+            [str(_pythonw_path()), str(destination)],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            close_fds=True,
+        )
+        return 0
+    except (OSError, RuntimeError) as error:
+        user32.MessageBoxW(
+            None,
+            f"Unable to install the downloaded update:\n\n{error}",
+            "Update Error",
+            MB_OK | MB_ICONERROR,
+        )
+        return 1
+    finally:
+        try:
+            staged_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _write_startup_registry() -> None:
@@ -1003,12 +1216,20 @@ def main() -> int:
         action="store_true",
         help="stop the app and remove it from login startup",
     )
+    action.add_argument(
+        "--apply-update",
+        type=Path,
+        metavar="PATH",
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
 
     if args.install:
         return install_startup()
     if args.uninstall:
         return uninstall_startup()
+    if args.apply_update:
+        return apply_update(args.apply_update)
     if Path(__file__).resolve() != _installed_script_path().resolve():
         return install_startup()
     _write_startup_registry()

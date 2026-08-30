@@ -1,7 +1,8 @@
 # MX Master 3S Hotkeys
 
-A lightweight Windows notification-area utility that remaps three standard
-mouse buttons without installing Logi Options+.
+A lightweight Windows notification-area utility that remaps standard mouse
+buttons and reverses horizontal thumb-wheel scrolling without installing
+Logi Options+.
 
 ## Button mappings
 
@@ -10,6 +11,7 @@ mouse buttons without installing Logi Options+.
 | Wheel / middle click | `Ctrl+W` |
 | Back button | `Escape` |
 | Forward button | `Right Arrow` |
+| Thumb wheel | Reverse horizontal scrolling |
 
 ## Install
 
@@ -40,6 +42,8 @@ Click or right-click the `Mx` icon to access:
   required.
 - The low-level Windows mouse hook applies these mappings to the corresponding
   buttons on every connected mouse.
+- Horizontal scrolling is reversed globally for every connected mouse that
+  reports `WM_MOUSEHWHEEL`; vertical wheel direction is unchanged.
 - To control an application running as Administrator, this utility must run at
   the same privilege level.
 

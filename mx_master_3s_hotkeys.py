@@ -4,6 +4,7 @@ Mappings:
     Middle / wheel click -> Ctrl+W
     Back button          -> Escape
     Forward button       -> Right Arrow
+    Thumb wheel          -> Reversed horizontal scrolling
 
 First run:
     Double-click the file, or run: py mx_master_3s_hotkeys.py
@@ -52,13 +53,17 @@ WM_LBUTTONUP = 0x0202
 WM_RBUTTONUP = 0x0205
 WM_XBUTTONDOWN = 0x020B
 WM_XBUTTONUP = 0x020C
+WM_MOUSEHWHEEL = 0x020E
 WM_APP = 0x8000
 WM_TRAYICON = WM_APP + 1
 XBUTTON1 = 0x0001  # Back
 XBUTTON2 = 0x0002  # Forward
 
-# Keyboard input constants
+# Input constants
+INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
+MOUSEEVENTF_HWHEEL = 0x1000
+SIDE_SCROLL_EXTRA_INFO = 0x4D585352  # "MXSR"
 KEYEVENTF_KEYUP = 0x0002
 VK_CONTROL = 0x11
 VK_ESCAPE = 0x1B
@@ -540,6 +545,22 @@ def send_keys(*virtual_keys: int) -> None:
     user32.SendInput(len(events), event_array, ctypes.sizeof(INPUT))
 
 
+def send_horizontal_wheel(delta: int) -> None:
+    """Send one horizontal wheel event with the supplied signed delta."""
+    event = INPUT(
+        type=INPUT_MOUSE,
+        mi=MOUSEINPUT(
+            0,
+            0,
+            delta & 0xFFFFFFFF,
+            MOUSEEVENTF_HWHEEL,
+            0,
+            SIDE_SCROLL_EXTRA_INFO,
+        ),
+    )
+    user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT))
+
+
 class MouseRemapper:
     def __init__(self) -> None:
         self._hook: wintypes.HHOOK | None = None
@@ -553,8 +574,22 @@ class MouseRemapper:
     def _xbutton(mouse_data: int) -> int:
         return (mouse_data >> 16) & 0xFFFF
 
+    @staticmethod
+    def _wheel_delta(mouse_data: int) -> int:
+        return ctypes.c_short((mouse_data >> 16) & 0xFFFF).value
+
     def _mouse_hook(self, code: int, message: int, data_address: int) -> int:
         if code >= 0:
+            if message == WM_MOUSEHWHEEL:
+                mouse_event = ctypes.cast(
+                    data_address, ctypes.POINTER(MSLLHOOKSTRUCT)
+                ).contents
+                if mouse_event.dwExtraInfo != SIDE_SCROLL_EXTRA_INFO:
+                    delta = self._wheel_delta(mouse_event.mouseData)
+                    if delta:
+                        send_horizontal_wheel(-delta)
+                    return 1
+
             if message == WM_MBUTTONDOWN:
                 send_keys(VK_CONTROL, VK_W)
                 return 1

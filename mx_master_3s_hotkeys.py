@@ -72,6 +72,7 @@ XBUTTON2 = 0x0002  # Forward
 INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
 MOUSEEVENTF_HWHEEL = 0x1000
+LLMHF_INJECTED = 0x00000001
 SIDE_SCROLL_EXTRA_INFO = 0x4D585352  # "MXSR"
 KEYEVENTF_KEYUP = 0x0002
 VK_CONTROL = 0x11
@@ -109,7 +110,7 @@ DT_SINGLELINE = 0x00000020
 
 # Startup and single-instance identity
 APP_NAME = "MX Master 3S Hotkeys"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 UPDATE_MANIFEST_URL = (
     "https://raw.githubusercontent.com/AdolfTWN/"
     "windows-utilities/main/latest.json"
@@ -607,11 +608,22 @@ class MouseRemapper:
                 mouse_event = ctypes.cast(
                     data_address, ctypes.POINTER(MSLLHOOKSTRUCT)
                 ).contents
-                if mouse_event.dwExtraInfo != SIDE_SCROLL_EXTRA_INFO:
-                    delta = self._wheel_delta(mouse_event.mouseData)
-                    if delta:
-                        send_horizontal_wheel(-delta)
-                    return 1
+                # Let synthesized wheel input pass through unchanged. Checking
+                # the Windows injection flag prevents our replacement event
+                # from being hooked and reversed again even if dwExtraInfo is
+                # cleared or rewritten by another input component.
+                if (
+                    mouse_event.flags & LLMHF_INJECTED
+                    or mouse_event.dwExtraInfo == SIDE_SCROLL_EXTRA_INFO
+                ):
+                    return user32.CallNextHookEx(
+                        self._hook, code, message, data_address
+                    )
+
+                delta = self._wheel_delta(mouse_event.mouseData)
+                if delta:
+                    send_horizontal_wheel(-delta)
+                return 1
 
             if message == WM_MBUTTONDOWN:
                 send_keys(VK_CONTROL, VK_W)

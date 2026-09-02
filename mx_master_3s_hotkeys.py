@@ -4,20 +4,27 @@ Mappings:
     Middle / wheel click -> Ctrl+W
     Back button          -> Escape
     Forward button       -> Right Arrow
-    Thumb wheel          -> Reversed horizontal scrolling
+    Thumb wheel          -> Native HID++ inverted horizontal scrolling
 
 First run:
     Double-click the file, or run: py mx_master_3s_hotkeys.py
 
-The first run installs it for the current user, starts it silently, and enables
-Always Run after Windows sign-in. The notification-area menu contains
-"Check for Updates", "Always Run", and "Uninstall...". Updates are downloaded
+The first run installs it for the current user and starts it silently.
+Auto Start is disabled by default and is enabled only by explicitly checking
+"Auto Start" in the notification-area menu. Unchecking it removes login startup.
+The menu also contains "Check for Updates" and "Uninstall...". Updates are downloaded
 from the public release repository, verified, installed, and restarted
 automatically. Uninstall requires explicit confirmation.
 
 The program uses only Python's standard library. Windows' low-level mouse hook
 does not identify the physical mouse, so the mappings apply to the same buttons
-on every connected mouse.
+on every connected mouse. Thumb-wheel inversion is configured directly on
+the MX Master 3S through HID++; wheel input is never suppressed or re-injected.
+Quit Options+ completely before starting this app. Use --portable to run
+without installing or enabling login startup. Legacy automatic startup entries
+are removed unless Auto Start was explicitly enabled in version 1.1.6 or later.
+Native wheel settings remain
+on the device after exit; --restore-thumb-wheel BACKUP.json restores a backup.
 """
 
 from __future__ import annotations
@@ -27,6 +34,7 @@ import ctypes
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import signal
@@ -65,6 +73,9 @@ WM_XBUTTONUP = 0x020C
 WM_MOUSEHWHEEL = 0x020E
 WM_APP = 0x8000
 WM_TRAYICON = WM_APP + 1
+WM_THUMB_STATUS = WM_APP + 2
+WM_POWERBROADCAST = 0x0218
+WM_DEVICECHANGE = 0x0219
 XBUTTON1 = 0x0001  # Back
 XBUTTON2 = 0x0002  # Forward
 
@@ -82,6 +93,7 @@ VK_W = 0x57
 
 # Notification area constants
 NIM_ADD = 0x00000000
+NIM_MODIFY = 0x00000001
 NIM_DELETE = 0x00000002
 NIF_MESSAGE = 0x00000001
 NIF_ICON = 0x00000002
@@ -110,7 +122,7 @@ DT_SINGLELINE = 0x00000020
 
 # Startup and single-instance identity
 APP_NAME = "MX Master 3S Hotkeys"
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.6"
 UPDATE_MANIFEST_URL = (
     "https://raw.githubusercontent.com/AdolfTWN/"
     "windows-utilities/main/latest.json"
@@ -569,23 +581,9 @@ def send_keys(*virtual_keys: int) -> None:
     user32.SendInput(len(events), event_array, ctypes.sizeof(INPUT))
 
 
-def send_horizontal_wheel(delta: int) -> None:
-    """Send one horizontal wheel event with the supplied signed delta."""
-    event = INPUT(
-        type=INPUT_MOUSE,
-        mi=MOUSEINPUT(
-            0,
-            0,
-            delta & 0xFFFFFFFF,
-            MOUSEEVENTF_HWHEEL,
-            0,
-            SIDE_SCROLL_EXTRA_INFO,
-        ),
-    )
-    user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT))
-
-
 class MouseRemapper:
+    """Remap buttons only. Wheel events always pass through unchanged."""
+
     def __init__(self) -> None:
         self._hook: wintypes.HHOOK | None = None
         self._thread_id: int | None = None
@@ -593,60 +591,40 @@ class MouseRemapper:
         self._stopped = threading.Event()
         self._startup_error: OSError | None = None
         self._callback = HOOKPROC(self._mouse_hook)
+        self._keys: queue.Queue[tuple[int, ...]] = queue.Queue(maxsize=64)
+        self._key_thread: threading.Thread | None = None
+        self._suppressed: set[int] = set()
 
-    @staticmethod
-    def _xbutton(mouse_data: int) -> int:
-        return (mouse_data >> 16) & 0xFFFF
-
-    @staticmethod
-    def _wheel_delta(mouse_data: int) -> int:
-        return ctypes.c_short((mouse_data >> 16) & 0xFFFF).value
+    def _send_key_events(self) -> None:
+        while not self._stopped.is_set():
+            try:
+                keys = self._keys.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if not self._stopped.is_set():
+                send_keys(*keys)
 
     def _mouse_hook(self, code: int, message: int, data_address: int) -> int:
-        if code >= 0:
-            if message == WM_MOUSEHWHEEL:
-                mouse_event = ctypes.cast(
-                    data_address, ctypes.POINTER(MSLLHOOKSTRUCT)
-                ).contents
-                # Let synthesized wheel input pass through unchanged. Checking
-                # the Windows injection flag prevents our replacement event
-                # from being hooked and reversed again even if dwExtraInfo is
-                # cleared or rewritten by another input component.
-                if (
-                    mouse_event.flags & LLMHF_INJECTED
-                    or mouse_event.dwExtraInfo == SIDE_SCROLL_EXTRA_INFO
-                ):
-                    return user32.CallNextHookEx(
-                        self._hook, code, message, data_address
-                    )
-
-                delta = self._wheel_delta(mouse_event.mouseData)
-                if delta:
-                    send_horizontal_wheel(-delta)
-                return 1
-
-            if message == WM_MBUTTONDOWN:
-                send_keys(VK_CONTROL, VK_W)
-                return 1
-            if message == WM_MBUTTONUP:
-                return 1
-
-            if message in (WM_XBUTTONDOWN, WM_XBUTTONUP):
-                mouse_data = ctypes.cast(
-                    data_address, ctypes.POINTER(MSLLHOOKSTRUCT)
-                ).contents.mouseData
-                button = self._xbutton(mouse_data)
-
-                if button == XBUTTON1:
-                    if message == WM_XBUTTONDOWN:
-                        send_keys(VK_ESCAPE)
-                    return 1
-
-                if button == XBUTTON2:
-                    if message == WM_XBUTTONDOWN:
-                        send_keys(VK_RIGHT)
-                    return 1
-
+        # Do not inspect, swallow, reverse, or synthesize any wheel event.
+        if code >= 0 and message in (
+            WM_MBUTTONDOWN, WM_MBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP
+        ):
+            event = ctypes.cast(data_address, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+            if not event.flags & LLMHF_INJECTED:
+                button = 0 if message in (WM_MBUTTONDOWN, WM_MBUTTONUP) else (event.mouseData >> 16) & 0xFFFF
+                keys = {0: (VK_CONTROL, VK_W), XBUTTON1: (VK_ESCAPE,), XBUTTON2: (VK_RIGHT,)}.get(button)
+                if keys is not None:
+                    if message in (WM_MBUTTONDOWN, WM_XBUTTONDOWN):
+                        try:
+                            self._keys.put_nowait(keys)
+                        except queue.Full:
+                            pass  # Preserve the physical click if the sender is busy.
+                        else:
+                            self._suppressed.add(button)
+                            return 1
+                    elif button in self._suppressed:
+                        self._suppressed.discard(button)
+                        return 1
         return user32.CallNextHookEx(self._hook, code, message, data_address)
 
     def _message_loop(self) -> None:
@@ -657,10 +635,11 @@ class MouseRemapper:
             self._ready.set()
             self._stopped.set()
             return
-
-        self._ready.set()
         message = wintypes.MSG()
         try:
+            self._key_thread = threading.Thread(target=self._send_key_events, name="MXMasterKeySender", daemon=True)
+            self._key_thread.start()
+            self._ready.set()
             while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
                 user32.TranslateMessage(ctypes.byref(message))
                 user32.DispatchMessageW(ctypes.byref(message))
@@ -671,25 +650,118 @@ class MouseRemapper:
             self._stopped.set()
 
     def start(self) -> None:
-        thread = threading.Thread(
-            target=self._message_loop,
-            name="MXMasterMouseHook",
-            daemon=True,
-        )
+        thread = threading.Thread(target=self._message_loop, name="MXMasterMouseHook", daemon=True)
         thread.start()
-        self._ready.wait()
+        if not self._ready.wait(timeout=3):
+            raise RuntimeError("Button hook startup timed out")
         if self._startup_error:
             raise self._startup_error
 
     def stop(self) -> None:
+        self._stopped.set()
         if self._thread_id is not None:
             user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
-            self._stopped.wait(timeout=2)
+        if self._key_thread is not None:
+            self._key_thread.join(timeout=0.5)
+
+
+class NativeThumbUnavailable(RuntimeError):
+    """The receiver or mouse is temporarily unavailable; retry later."""
+
+
+class NativeThumbStopped(RuntimeError):
+    """Configuration was cancelled because the app is shutting down."""
+
+
+class NativeThumbRecovery:
+    """Serialize bounded HID++ attempts outside the UI and input callback."""
+
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._suspended = threading.Event()
+        self._hwnd: wintypes.HWND | None = None
+        self._thread: threading.Thread | None = None
+        self.status = "Waiting for receiver"
+        self._last_detail = ""
+
+    def _publish(self, status: str, detail: str = "") -> None:
+        changed = (status, detail) != (self.status, self._last_detail)
+        self.status, self._last_detail = status, detail
+        if changed:
+            try:
+                path = _installed_script_path().parent / "native-thumb-status.json"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = path.with_suffix(".tmp")
+                temporary.write_text(json.dumps({
+                    "version": APP_VERSION, "status": status, "detail": detail,
+                    "updated": time.time(),
+                }, ensure_ascii=False, indent=2), encoding="utf-8")
+                temporary.replace(path)
+            except OSError:
+                pass  # A diagnostic write must not terminate recovery.
+        if self._hwnd and not self._stop.is_set():
+            user32.PostMessageW(self._hwnd, WM_THUMB_STATUS, 0, 0)
+
+    def start(self, hwnd: wintypes.HWND) -> None:
+        self._hwnd = hwnd
+        self._thread = threading.Thread(target=self._run, name="MXNativeThumbRecovery", daemon=True)
+        self._thread.start()
+
+    def request(self) -> None:
+        self._wake.set()
+
+    def suspend(self) -> None:
+        self._suspended.set()
+        self._wake.set()
+
+    def resume(self) -> None:
+        self._suspended.clear()
+        self._wake.set()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+
+    def join(self) -> None:
+        if self._thread is not None:
+            self._thread.join(timeout=3)
+
+    def _run(self) -> None:
+        delays = (2, 5, 10, 30, 60)
+        failures = 0
+        delay = 0
+        while not self._stop.is_set():
+            self._wake.wait(delay)
+            self._wake.clear()
+            if self._stop.is_set():
+                return
+            if self._suspended.is_set():
+                delay = None
+                continue
+            try:
+                _configure_native_thumb_wheel(stop_event=self._stop)
+            except NativeThumbStopped:
+                return
+            except NativeThumbUnavailable as error:
+                delay = delays[min(failures, len(delays) - 1)]
+                failures += 1
+                self._publish("Waiting for receiver", str(error))
+            except (OSError, RuntimeError, ValueError) as error:
+                # Unsupported devices, Options+ conflicts and local file errors
+                # require user action, not an endless settings-write loop.
+                self._publish("Configuration unavailable", str(error))
+                delay = None
+            else:
+                self._publish("Native inversion active")
+                failures = 0
+                delay = None  # No repeated writes after success.
 
 
 class TrayApplication:
-    def __init__(self, remapper: MouseRemapper) -> None:
+    def __init__(self, remapper: MouseRemapper, native: NativeThumbRecovery) -> None:
         self.remapper = remapper
+        self.native = native
         self.hwnd: wintypes.HWND | None = None
         self._notify_data: NOTIFYICONDATAW | None = None
         self._icon: wintypes.HICON | None = None
@@ -767,10 +839,11 @@ class TrayApplication:
             return
         try:
             _remove_startup_registry()
+            _save_auto_start_consent(False)
         except OSError as error:
             user32.MessageBoxW(
                 self.hwnd,
-                f"Unable to remove Always Run:\n\n{error}",
+                f"Unable to remove Auto Start:\n\n{error}",
                 APP_NAME,
                 0x00000010,
             )
@@ -778,23 +851,25 @@ class TrayApplication:
         self._uninstalling = True
         user32.DestroyWindow(self.hwnd)
 
-    def _confirm_always_run(self) -> None:
+    def _toggle_auto_start(self) -> None:
         if not self.hwnd:
             return
         try:
-            _write_startup_registry()
-            user32.MessageBoxW(
-                self.hwnd,
-                "Always Run is enabled.\n\n"
-                "MX Master 3S Hotkeys will start automatically after every "
-                "Windows sign-in.",
-                APP_NAME,
-                MB_OK | MB_ICONINFORMATION,
-            )
+            if _auto_start_enabled():
+                _remove_startup_registry()
+                _save_auto_start_consent(False)
+            else:
+                # This menu click is the only path that registers startup.
+                _write_startup_registry()
+                try:
+                    _save_auto_start_consent(True)
+                except OSError:
+                    _remove_startup_registry()
+                    raise
         except OSError as error:
             user32.MessageBoxW(
                 self.hwnd,
-                f"Unable to enable Always Run:\n\n{error}",
+                f"Unable to change Auto Start:\n\n{error}",
                 APP_NAME,
                 0x00000010,
             )
@@ -815,9 +890,9 @@ class TrayApplication:
             user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
             user32.AppendMenuW(
                 menu,
-                MF_STRING | MF_CHECKED,
+                MF_STRING | (MF_CHECKED if _auto_start_enabled() else 0),
                 ID_ALWAYS_RUN,
-                "Always Run",
+                "Auto Start",
             )
             user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
             user32.AppendMenuW(menu, MF_STRING, ID_UNINSTALL, "Uninstall...")
@@ -836,7 +911,7 @@ class TrayApplication:
             if command == ID_CHECK_FOR_UPDATES:
                 self._check_for_updates()
             elif command == ID_ALWAYS_RUN:
-                self._confirm_always_run()
+                self._toggle_auto_start()
             elif command == ID_UNINSTALL:
                 self._confirm_uninstall()
             if self.hwnd:
@@ -851,6 +926,23 @@ class TrayApplication:
         wparam: int,
         lparam: int,
     ) -> int:
+        if message == WM_POWERBROADCAST:
+            if wparam == 0x04:  # PBT_APMSUSPEND
+                self.native.suspend()
+            elif wparam in (0x06, 0x07, 0x12):  # Resume critical, user, automatic.
+                self.native.resume()
+            return 1
+
+        if message == WM_DEVICECHANGE and wparam in (0x0007, 0x8000, 0x8004):
+            self.native.request()
+            return 1
+
+        if message == WM_THUMB_STATUS:
+            if self._notify_data is not None:
+                self._notify_data.szTip = f"{APP_NAME} {APP_VERSION} — {self.native.status}"[:127]
+                shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self._notify_data))
+            return 0
+
         if message == WM_TRAYICON:
             if lparam in (WM_LBUTTONUP, WM_RBUTTONUP, WM_CONTEXTMENU):
                 self._show_menu()
@@ -861,6 +953,7 @@ class TrayApplication:
             return 0
 
         if message == WM_DESTROY:
+            self.native.stop()
             if self._notify_data is not None:
                 shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._notify_data))
             if self._owns_icon and self._icon:
@@ -928,11 +1021,13 @@ class TrayApplication:
         notify_data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
         notify_data.uCallbackMessage = WM_TRAYICON
         notify_data.hIcon = icon
-        notify_data.szTip = f"{APP_NAME} {APP_VERSION} — Always Run"
+        notify_data.szTip = f"{APP_NAME} {APP_VERSION} — {self.native.status}"[:127]
         self._notify_data = notify_data
 
         if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(notify_data)):
             raise ctypes.WinError(ctypes.get_last_error())
+
+        self.native.start(self.hwnd)
 
         message = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
@@ -940,6 +1035,306 @@ class TrayApplication:
             user32.DispatchMessageW(ctypes.byref(message))
         return 0
 
+
+
+def _ensure_options_stopped() -> None:
+    class ProcessEntry(ctypes.Structure):
+        _fields_ = [("size", wintypes.DWORD), ("usage", wintypes.DWORD),
+                    ("pid", wintypes.DWORD), ("heap", ctypes.c_size_t),
+                    ("module", wintypes.DWORD), ("threads", wintypes.DWORD),
+                    ("parent", wintypes.DWORD), ("priority", wintypes.LONG),
+                    ("flags", wintypes.DWORD), ("exe", wintypes.WCHAR * 260)]
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
+    snapshot = kernel32.CreateToolhelp32Snapshot(2, 0)
+    if snapshot == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        entry = ProcessEntry()
+        entry.size = ctypes.sizeof(entry)
+        present = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        if not present:
+            raise ctypes.WinError(ctypes.get_last_error())
+        while present:
+            if entry.exe.lower() in ("logioptionsplus_agent.exe", "logioptionsplus_app.exe"):
+                raise RuntimeError(
+                    "Options+ is running. Fully exit Options+ and its agent before "
+                    "starting MX Master 3S Hotkeys; both programs must not control the mouse together."
+                )
+            present = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+
+
+def _run_thumb_worker(*arguments: str, stop_event: threading.Event | None = None) -> str:
+    worker = subprocess.Popen(
+        [str(_pythonw_path()), "-c", _NATIVE_THUMB_WORKER, *arguments],
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    deadline = time.monotonic() + 12
+    try:
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                raise NativeThumbStopped("Application is exiting")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise NativeThumbUnavailable("Native thumb-wheel configuration timed out; waiting to retry.")
+            try:
+                output, error = worker.communicate(timeout=min(0.2, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+            try:
+                worker.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+    if worker.returncode == 75:
+        raise NativeThumbUnavailable(error[-1800:])
+    if worker.returncode:
+        raise RuntimeError("Unable to configure the native thumb wheel:\n" + error[-1800:])
+    return output
+
+
+def _configure_native_thumb_wheel(*, stop_event: threading.Event | None = None) -> None:
+    _ensure_options_stopped()
+    directory = _installed_script_path().parent / "thumbwheel-backups"
+    directory.mkdir(parents=True, exist_ok=True)
+    backup = directory / (str(time.time_ns()) + ".json")
+    _run_thumb_worker("--native-inverted", "--backup", str(backup), stop_event=stop_event)
+
+
+_NATIVE_THUMB_WORKER = r'''
+"""Configure a Logitech thumb wheel through HID++, without input injection.
+
+Windows only; standard library only. Default: read the current configuration.
+Use --native-inverted to enable native HID scrolling with device inversion.
+Use --restore BACKUP.json to restore the two saved thumb-wheel settings.
+"""
+from __future__ import annotations
+
+import argparse
+import ctypes as c
+from ctypes import wintypes as w
+import json
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+u = c.WinDLL('user32', use_last_error=True)
+k = c.WinDLL('kernel32', use_last_error=True)
+
+
+class Device(c.Structure):
+    _fields_ = [('handle', w.HANDLE), ('type', w.DWORD)]
+
+
+class HidInfo(c.Structure):
+    _fields_ = [('vendor', w.DWORD), ('product', w.DWORD), ('version', w.DWORD),
+                ('page', w.USHORT), ('usage', w.USHORT)]
+
+
+class InfoUnion(c.Union):
+    _fields_ = [('hid', HidInfo), ('padding', c.c_byte * 24)]
+
+
+class DeviceInfo(c.Structure):
+    _fields_ = [('size', w.DWORD), ('type', w.DWORD), ('data', InfoUnion)]
+
+
+class Overlapped(c.Structure):
+    _fields_ = [('internal', c.c_size_t), ('internal_high', c.c_size_t),
+                ('offset', w.DWORD), ('offset_high', w.DWORD), ('event', w.HANDLE)]
+
+
+u.GetRawInputDeviceList.argtypes = [c.POINTER(Device), c.POINTER(w.UINT), w.UINT]
+u.GetRawInputDeviceList.restype = w.UINT
+u.GetRawInputDeviceInfoW.argtypes = [w.HANDLE, w.UINT, w.LPVOID, c.POINTER(w.UINT)]
+u.GetRawInputDeviceInfoW.restype = w.UINT
+k.CreateFileW.argtypes = [w.LPCWSTR, w.DWORD, w.DWORD, w.LPVOID, w.DWORD, w.DWORD, w.HANDLE]
+k.CreateFileW.restype = w.HANDLE
+k.CloseHandle.argtypes = [w.HANDLE]
+k.CreateEventW.argtypes = [w.LPVOID, w.BOOL, w.BOOL, w.LPCWSTR]
+k.CreateEventW.restype = w.HANDLE
+for name in ('ReadFile', 'WriteFile'):
+    getattr(k, name).argtypes = [w.HANDLE, w.LPVOID, w.DWORD, c.POINTER(w.DWORD), c.POINTER(Overlapped)]
+    getattr(k, name).restype = w.BOOL
+k.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]
+k.WaitForSingleObject.restype = w.DWORD
+k.GetOverlappedResult.argtypes = [w.HANDLE, c.POINTER(Overlapped), c.POINTER(w.DWORD), w.BOOL]
+k.GetOverlappedResult.restype = w.BOOL
+k.CancelIoEx.argtypes = [w.HANDLE, c.POINTER(Overlapped)]
+
+
+def interfaces():
+    count = w.UINT()
+    if u.GetRawInputDeviceList(None, c.byref(count), c.sizeof(Device)) == 0xffffffff:
+        raise c.WinError(c.get_last_error())
+    devices = (Device * count.value)()
+    result = u.GetRawInputDeviceList(devices, c.byref(count), c.sizeof(Device))
+    if result == 0xffffffff:
+        raise c.WinError(c.get_last_error())
+    for device in devices[:result]:
+        if device.type != 2:
+            continue
+        info = DeviceInfo(); info.size = c.sizeof(info)
+        size = w.UINT(c.sizeof(info))
+        if u.GetRawInputDeviceInfoW(device.handle, 0x2000000b, c.byref(info), c.byref(size)) == 0xffffffff:
+            continue
+        hid = info.data.hid
+        # Long HID++ reports: Logitech vendor page, usage 2 (20 bytes).
+        if (hid.vendor, hid.page, hid.usage) != (0x046d, 0xff00, 2):
+            continue
+        length = w.UINT()
+        u.GetRawInputDeviceInfoW(device.handle, 0x20000007, None, c.byref(length))
+        name = c.create_unicode_buffer(length.value + 1)
+        if u.GetRawInputDeviceInfoW(device.handle, 0x20000007, name, c.byref(length)) == 0xffffffff:
+            continue
+        yield {'path': name.value, 'product': hid.product}
+
+
+class Hidpp:
+    def __init__(self, path):
+        self.pending = []
+        self.handle = k.CreateFileW(path, 0xc0000000, 3, None, 3, 0x40000000, None)
+        if self.handle == c.c_void_p(-1).value:
+            raise c.WinError(c.get_last_error())
+
+    def close(self):
+        if self.handle:
+            k.CloseHandle(self.handle)
+            self.handle = None
+
+    def io(self, data=None, timeout_ms=1000):
+        buf = c.create_string_buffer(data, len(data)) if data is not None else c.create_string_buffer(20)
+        done = w.DWORD()
+        ov = Overlapped(); ov.event = k.CreateEventW(None, True, False, None)
+        if not ov.event:
+            raise c.WinError(c.get_last_error())
+        release_event = True
+        try:
+            fn = k.WriteFile if data is not None else k.ReadFile
+            ok = fn(self.handle, buf, len(buf), c.byref(done), c.byref(ov))
+            if not ok:
+                error = c.get_last_error()
+                if error != 997:
+                    raise c.WinError(error)
+                if k.WaitForSingleObject(ov.event, timeout_ms) != 0:
+                    k.CancelIoEx(self.handle, c.byref(ov))
+                    if k.WaitForSingleObject(ov.event, 250) != 0:
+                        # Cancellation is asynchronous. Keep its memory alive until
+                        # process exit; never free a pending OVERLAPPED or buffer.
+                        self.pending.append((ov, buf, done))
+                        release_event = False
+                    raise TimeoutError('HID++ request timed out')
+                if not k.GetOverlappedResult(self.handle, c.byref(ov), c.byref(done), False):
+                    raise c.WinError(c.get_last_error())
+            if data is not None and done.value != len(data):
+                raise OSError('Incomplete HID++ write')
+            return bytes(buf[:done.value])
+        finally:
+            if release_event:
+                k.CloseHandle(ov.event)
+
+    def request(self, index, feature, function, params=b'', timeout=.8):
+        header = bytes((0x11, index, feature, function | 0x0d))
+        self.io((header + params).ljust(20, b'\0'))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            reply = self.io(timeout_ms=max(1, int((deadline-time.monotonic())*1000)))
+            if reply[:4] == header:
+                return reply[4:]
+            if len(reply) >= 7 and reply[1] == index and reply[2] == 0x8f and reply[3:5] == header[2:4]:
+                raise RuntimeError(f'HID++ error 0x{reply[5]:02x}')
+        raise TimeoutError('Matching HID++ response not received')
+
+    def feature(self, index, feature_id):
+        return self.request(index, 0, 0, feature_id.to_bytes(2, 'big'))[0]
+
+    def name(self, index):
+        feature = self.feature(index, 0x0005)
+        if not feature:
+            return 'Unknown Logitech device'
+        length = self.request(index, feature, 0)[0]
+        result = b''
+        while len(result) < length:
+            result += self.request(index, feature, 0x10, bytes((len(result),)))
+        return result[:length].decode('utf-8', errors='replace')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument('--native-inverted', action='store_true')
+    actions.add_argument('--restore', type=Path)
+    parser.add_argument('--backup', type=Path)
+    parser.add_argument('--index', type=int, default=5, help='Receiver slot observed during diagnostics')
+    args = parser.parse_args()
+    devices = list(interfaces())
+    if not devices:
+        print('Logitech receiver interface is not available yet.', file=sys.stderr)
+        raise SystemExit(75)
+    if len(devices) != 1:
+        raise RuntimeError(f'Expected one Logitech long-report interface, found {len(devices)}')
+    endpoint = devices[0]
+    device = Hidpp(endpoint['path'])
+    try:
+        feature = device.feature(args.index, 0x2150)
+        if not feature:
+            raise RuntimeError('Selected device does not expose THUMB_WHEEL (0x2150)')
+        name = device.name(args.index)
+        if 'MX Master 3S' not in name:
+            raise RuntimeError(f'Refusing to change unexpected device: {name!r}')
+        before = device.request(args.index, feature, 0x10)
+        state = dict(name=name, product=endpoint['product'], index=args.index,
+                     feature_id='0x2150', feature_index=feature,
+                     mode=before[0], inverted=bool(before[1] & 1),
+                     raw_status=before.hex(), info=device.request(args.index, feature, 0).hex())
+        print(json.dumps({'before': state}, indent=2), flush=True)
+        already_native_inverted = args.native_inverted and (before[0], before[1] & 1) == (0, 1)
+        if args.backup and not already_native_inverted:
+            with args.backup.open('x', encoding='utf-8') as f:
+                json.dump(state, f, indent=2)
+        target = None
+        if args.native_inverted:
+            if not args.backup:
+                raise RuntimeError('--backup is required before changing device settings')
+            target = (0, 1)
+        elif args.restore:
+            saved = json.loads(args.restore.read_text(encoding='utf-8'))
+            if (saved['name'],saved['product'],saved['index']) != (name,endpoint['product'],args.index):
+                raise RuntimeError('Backup does not match the selected device')
+            target = (saved['mode'], int(saved['inverted']))
+            if target[0] not in (0, 1):
+                raise RuntimeError('Invalid reporting mode in backup')
+        if target and (before[0], before[1] & 1) != target:
+            device.request(args.index, feature, 0x20, bytes((*target, 0)))
+            after = device.request(args.index, feature, 0x10)
+            actual = (after[0], after[1] & 1)
+            if actual != target:
+                raise RuntimeError(f'Readback mismatch: expected {target}, received {actual}')
+            print(json.dumps({'after': {'mode':actual[0], 'inverted':bool(actual[1]), 'raw_status':after.hex()}}, indent=2),flush=True)
+    finally:
+        device.close()
+
+
+try:
+    main()
+except TimeoutError as error:
+    print(str(error), file=sys.stderr)
+    raise SystemExit(75)
+except OSError as error:
+    if getattr(error, 'winerror', None) in (2, 6, 21, 31, 121, 995, 1167):
+        print(str(error), file=sys.stderr)
+        raise SystemExit(75)
+    raise
+'''
 
 def _pythonw_path() -> Path:
     executable = Path(sys.executable).resolve()
@@ -1060,7 +1455,6 @@ def apply_update(staged_path: Path) -> int:
         _wait_until_stopped(timeout_seconds=10.0)
         _wait_for_instance_release(timeout_ms=10000)
         os.replace(staged_path, destination)
-        _write_startup_registry()
         subprocess.Popen(
             [str(_pythonw_path()), str(destination)],
             creationflags=subprocess.CREATE_NO_WINDOW,
@@ -1083,10 +1477,50 @@ def apply_update(staged_path: Path) -> int:
 
 
 def _write_startup_registry() -> None:
-    destination = _installed_script_path()
+    # A portable launch must register the file that actually exists and is running.
+    destination = Path(__file__).resolve()
     command = subprocess.list2cmdline([str(_pythonw_path()), str(destination)])
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
         winreg.SetValueEx(key, RUN_VALUE_NAME, 0, winreg.REG_SZ, command)
+
+
+def _auto_start_consent_path() -> Path:
+    return _installed_script_path().parent / "auto-start-consent.json"
+
+
+def _auto_start_opted_in() -> bool:
+    try:
+        value = json.loads(_auto_start_consent_path().read_text(encoding="utf-8"))
+        return isinstance(value, dict) and value.get("enabled") is True
+    except (FileNotFoundError, ValueError, UnicodeError):
+        return False
+
+
+def _save_auto_start_consent(enabled: bool) -> None:
+    path = _auto_start_consent_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"enabled": enabled}), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _auto_start_enabled() -> bool:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_READ) as key:
+            command, kind = winreg.QueryValueEx(key, RUN_VALUE_NAME)
+        # Reflect the real entry, including one pointing to an older/portable
+        # copy, so the user can always uncheck an existing registration.
+        return kind in (winreg.REG_SZ, winreg.REG_EXPAND_SZ) and bool(command)
+    except OSError:
+        return False
+
+
+def _apply_startup_default() -> None:
+    # Older versions registered Run automatically, so an existing entry is not
+    # evidence of consent. Remove that legacy entry until the user opts in here.
+    # Never recreate an entry deleted externally, even when consent is saved.
+    if not _auto_start_opted_in():
+        _remove_startup_registry()
 
 
 def _remove_startup_registry() -> None:
@@ -1148,7 +1582,7 @@ def _wait_for_instance_release(timeout_ms: int = 4000) -> bool:
         kernel32.CloseHandle(mutex)
 
 
-def _start_installed_app(timeout_seconds: float = 8.0) -> None:
+def _start_installed_app(timeout_seconds: float = 20.0) -> None:
     destination = _installed_script_path()
     process = subprocess.Popen(
         [str(_pythonw_path()), str(destination)],
@@ -1169,6 +1603,7 @@ def _start_installed_app(timeout_seconds: float = 8.0) -> None:
 
 
 def install_startup() -> int:
+    _ensure_options_stopped()
     source = Path(__file__).resolve()
     destination = _installed_script_path()
 
@@ -1180,22 +1615,22 @@ def install_startup() -> int:
             "once, then run this file again."
         )
 
+    _apply_startup_default()
     destination.parent.mkdir(parents=True, exist_ok=True)
     if source != destination:
         shutil.copy2(source, destination)
-
-    _write_startup_registry()
 
     _start_installed_app()
     user32.MessageBoxW(
         None,
         "MX Master 3S Hotkeys is installed and active.\n\n"
-        "The notification icon will remain available near the Windows clock.",
+        "The notification icon will remain available near the Windows clock.\n"
+        "Login startup is not enabled by installation. Use Auto Start to opt in.",
         APP_NAME,
         MB_OK | MB_ICONINFORMATION,
     )
     print(f"{APP_NAME} installed and started.")
-    print("It will start automatically after you sign in to Windows.")
+    print("Installation does not enable Auto Start. Use the tray checkbox to opt in.")
     return 0
 
 
@@ -1203,6 +1638,7 @@ def uninstall_startup() -> int:
     _request_running_app_exit()
     _wait_until_stopped()
     _remove_startup_registry()
+    _save_auto_start_consent(False)
     _remove_installed_files()
 
     print(f"{APP_NAME} stopped and removed from startup.")
@@ -1219,7 +1655,8 @@ def run_tray_app() -> int:
         return 0
 
     remapper = MouseRemapper()
-    tray = TrayApplication(remapper)
+    native = NativeThumbRecovery()
+    tray = TrayApplication(remapper, native)
 
     def request_exit(_signum: int, _frame: object) -> None:
         tray.request_exit()
@@ -1229,9 +1666,11 @@ def run_tray_app() -> int:
         signal.signal(signal.SIGBREAK, request_exit)
 
     try:
+        _apply_startup_default()
+        _ensure_options_stopped()
         remapper.start()
         return tray.run()
-    except OSError as error:
+    except (OSError, RuntimeError) as error:
         remapper.stop()
         user32.MessageBoxW(
             None,
@@ -1241,6 +1680,9 @@ def run_tray_app() -> int:
         )
         return 1
     finally:
+        native.stop()
+        native.join()
+        remapper.stop()
         kernel32.CloseHandle(mutex)
 
 
@@ -1250,7 +1692,7 @@ def main() -> int:
     action.add_argument(
         "--install",
         action="store_true",
-        help="install for this user, start silently, and enable login startup",
+        help="install for this user and start silently; Auto Start is off by default",
     )
     action.add_argument(
         "--uninstall",
@@ -1263,7 +1705,19 @@ def main() -> int:
         metavar="PATH",
         help=argparse.SUPPRESS,
     )
+    action.add_argument("--portable", action="store_true", help="run without installing or enabling login startup")
+    action.add_argument("--restore-thumb-wheel", type=Path, metavar="BACKUP.json", help="restore saved device settings")
     args = parser.parse_args()
+
+    if args.portable:
+        return run_tray_app()
+    if args.restore_thumb_wheel:
+        try:
+            _run_thumb_worker("--restore", str(args.restore_thumb_wheel.resolve()))
+            return 0
+        except (OSError, RuntimeError) as error:
+            user32.MessageBoxW(None, str(error), APP_NAME, MB_OK | MB_ICONERROR)
+            return 1
 
     if args.install:
         try:
@@ -1291,7 +1745,6 @@ def main() -> int:
                 MB_OK | MB_ICONERROR,
             )
             return 1
-    _write_startup_registry()
     return run_tray_app()
 
 
